@@ -1,0 +1,2 @@
+timestamp,interval_s,status,latitude,longitude,target_bearing,heading,angle_error,ax,ay,az,gx,gy,gz,temp,pitch,error
+2026-11-13T14:21:40.152+09:00,,ok,,,,,,0.010,-0.020,0.980,0.50,-0.10,0.05,25.30,0.58,

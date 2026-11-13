@@ -1,0 +1,23 @@
+[Unit]
+Description=Arduino UNO Q Smart Goggles Python Navigation Service
+After=network.target arduino-router.service
+Wants=arduino-router.service
+
+[Service]
+Type=simple
+# 실제 보드 내 smart-goggles 설치 경로에 맞추어 User 및 WorkingDirectory가 자동 조정될 수 있습니다.
+# (기본값: /home/arduino/smart-goggles)
+WorkingDirectory=/home/arduino/smart-goggles
+ExecStart=/bin/bash /home/arduino/smart-goggles/auto_start.sh run
+Restart=always
+RestartSec=3
+
+# 표준 출력 및 에러 로깅
+StandardOutput=append:/home/arduino/smart-goggles/logs/smart_goggles.log
+StandardError=append:/home/arduino/smart-goggles/logs/smart_goggles.err.log
+
+# 환경변수 설정 예시
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
