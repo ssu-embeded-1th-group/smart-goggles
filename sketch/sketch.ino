@@ -12,7 +12,7 @@
  *
  * ── 배선 (결선도 rev 3.0, UNO Q 핀은 3.3V 로직) ──────
  *   MPU-6050 : VCC→3.3V  GND→GND  SDA→헤더 SDA(D20)  SCL→헤더 SCL(D21)  AD0→GND (주소 0x68, A4/A5 아님)
- *   OLED     : 4선 SPI (모듈 출고 기본값)  VCC→3.3V  GND→GND
+ *   OLED     : Waveshare 1.51인치 투명 OLED (SSD1309), 4선 SPI (출고 기본값)  VCC→3.3V  GND→GND
  *              DIN→D11  CLK→D13  CS→D10  DC→D7  RES(RST)→D8
  *              ※ 뒷면 0Ω 저항을 옮겨 I2C로 바꾼 모듈이면 OLED_USE_SPI를 0으로 하고 SDA/SCL에 연결
  *   GPS      : GND→GND  GPS의 TX→D0(RX)   VCC는 모듈 규격대로
@@ -20,12 +20,20 @@
  *   진동모터 : 왼쪽 D5, 오른쪽 D6 → 트랜지스터(모터 드라이버) 모듈의 신호 입력
  *              ※ 모터를 핀에 직접 연결하면 안 됨 (모터가 핀이 낼 수 있는 전류보다 많이 씀)
  *
- * ── 가상 GPS (GPS_MOCK_DEFAULT = 1) ──────────────────
- *   GPS 모듈 없이 책상에서 테스트하는 모드. 화면 아래에 "MOCK GPS"가 표시됨
+ * ── GPS 모드 (GPS_MODE) ─────────────────────────────
+ *   2 = 자동 (기본값): 부팅 후 가상 GPS로 시작했다가, D0로 GPS 문장(체크섬이 맞는 NMEA)이
+ *       한 번이라도 들어오면 그때부터 실제 GPS로 바뀜 (재부팅 전까지 다시 가상으로 돌아가지 않음)
+ *       → 책상(GPS 모듈 없음)은 자동으로 가상, 야외 실측(GPS 모듈 연결)은 자동으로 실제
+ *   1 = 항상 가상 GPS : GPS 모듈을 꽂은 채로 책상 테스트를 할 때
+ *   0 = 항상 실제 GPS : 실측 때 확실하게 고정하고 싶을 때
+ *   리눅스에서 set_gps_mock(True/False)를 호출하면 그 값으로 고정됨 (자동 전환 끝)
+ *   지금 모드는 화면 맨 아래("MOCK GPS" / "GPS S08")와 read_nav의 mock 칸에서 확인
+ *
+ * ── 가상 GPS ─────────────────────────────────────────
+ *   GPS 모듈 없이 책상에서 테스트하는 모드
  *   · 시작 위치 = MOCK_START_LAT/LON, 부팅 때 바라보는 방향 = MOCK_START_HEADING(0 = 북쪽)으로 가정
  *   · 보드를 돌리면 heading이 바뀌어 화살표와 진동이 따라 바뀜
  *   · 화살표가 정면(GO)인 동안에는 바라보는 방향으로 MOCK_SPEED_MPS 속도로 "걸어감" → 도착 화면까지 확인 가능
- *   실제 GPS로 바꾸려면 GPS_MOCK_DEFAULT를 0으로 (또는 리눅스에서 set_gps_mock(False) 호출)
  *
  * ── Bridge로 제공하는 함수 (Python: Bridge.call("이름", 인자...)) ──
  *   imu_ready()          → bool   : 최근 0.1초 주기의 MPU-6050 읽기가 성공했으면 true
@@ -57,7 +65,7 @@
 // ═════════ 1. 설정: 하드웨어에 맞게 여기만 고치면 됨 ═════════
 
 // 실행 모드
-#define GPS_MOCK_DEFAULT    1           // 1: 가상 GPS로 시작 (실내 책상 디버깅) / 0: 실제 GPS 모듈
+#define GPS_MODE            2           // 2: 자동 (GPS 데이터가 들어오면 실제, 없으면 가상) / 1: 항상 가상 / 0: 항상 실제
 
 // 목적지 (리눅스 config.py의 TARGET_LATITUDE / TARGET_LONGITUDE 기본값과 같은 값)
 #define TARGET_LAT          37.4963
@@ -89,7 +97,7 @@
 #define OLED_WIRE           Wire        // MPU-6050과 같은 SDA/SCL
 #define OLED_ADDR           0x3C        // 대부분 0x3C, 일부 모듈은 0x3D
 // 공통
-#define OLED_IS_SH1106      0           // 0: SSD1306 (보통 0.96인치) / 1: SH1106 (보통 1.3인치)
+#define OLED_CHIP           1309        // 1309: SSD1309 (Waveshare 1.51인치 투명 OLED) / 1306: SSD1306 (0.96인치) / 1106: SH1106 (1.3인치)
 #define OLED_FLIP_H         0           // 1: 좌우 반전 (반사판·거울로 볼 때)
 #define OLED_FLIP_V         0           // 1: 상하 반전
 
@@ -98,6 +106,13 @@
 // D0/D1 UART의 이름은 보드 코어 버전에 따라 다름 → 자동 선택
 //   코어 0.55 이상: Serial = Monitor(리눅스 콘솔), D0/D1 = Serial1
 //   그 이전 코어  : D0/D1 = Serial, Serial1은 Bridge 전용 (GPS에 쓰면 Bridge가 끊김)
+#if OLED_CHIP != 1309 && OLED_CHIP != 1306 && OLED_CHIP != 1106
+#error "OLED_CHIP은 1309, 1306, 1106 중 하나여야 함"
+#endif
+#if GPS_MODE < 0 || GPS_MODE > 2
+#error "GPS_MODE는 0, 1, 2 중 하나여야 함"
+#endif
+
 #ifndef GPS_SERIAL
 #ifdef ARDUINO_ROUTER_SERIAL
 #define GPS_SERIAL Serial1
@@ -233,7 +248,7 @@ const uint8_t OLED_CHUNK              = 16;     // (I2C: Wire 버퍼 크기 안�
 #endif
 const unsigned long OLED_RETRY_MS     = 2000;   // 응답이 없을 때 다시 초기화를 시도하는 간격
 const unsigned long OLED_REFRESH_MS   = 5000;   // 설정을 다시 보내고 화면 전체를 새로 그리는 간격 (전원 순간 끊김 복구)
-#if OLED_IS_SH1106
+#if OLED_CHIP == 1106
 const uint8_t OLED_COLUMN_OFFSET      = 2;      // SH1106은 내부 132칸 중 가운데 128칸을 씀
 #else
 const uint8_t OLED_COLUMN_OFFSET      = 0;
@@ -297,7 +312,8 @@ bool heading_have_last = false;
 // GPS
 gps_fix gps_real;                        // 실제 GPS 모듈에서 읽은 값
 gps_fix gps_mock;                        // 가상 GPS 값
-bool gps_use_mock = (GPS_MOCK_DEFAULT != 0);
+bool gps_use_mock = (GPS_MODE != 0);       // 지금 가상 GPS를 쓰는지
+bool gps_auto = (GPS_MODE == 2);          // 자동 모드: GPS 문장이 들어오면 실제 GPS로 바꿈
 char gps_line[100];                      // 받는 중인 NMEA 문장 한 줄
 uint8_t gps_len = 0;
 unsigned long gps_sentence_count = 0;    // 체크섬이 맞은 문장 수 (배선 확인용)
@@ -1013,7 +1029,7 @@ void nav_tick(unsigned long now) {
   nav_state = state;
 }
 
-// ═════════ 12. OLED (SSD1306 / SH1106, 라이브러리 없이 SPI 또는 Wire로 직접 구동) ═════════
+// ═════════ 12. OLED (SSD1309 / SSD1306 / SH1106, 라이브러리 없이 SPI 또는 Wire로 직접 구동) ═════════
 // ── 전송: 이 부분만 SPI / I2C에 따라 다름. 나머지(그리기·화면 갱신)는 공통 ──
 #if OLED_USE_SPI
 // DC 핀으로 명령(LOW)/데이터(HIGH)를 구분해서 보냄.
@@ -1076,23 +1092,38 @@ bool oled_data(const uint8_t *bytes, uint8_t count) {
 bool oled_send_config(bool display_off_first) {
   static const uint8_t config[] = {
     0xAE,                                          // 화면 끄기 (부팅 때만 보냄)
+#if OLED_CHIP == 1309
+    0xFD, 0x12,                                    // 명령 잠금 해제 (SSD1309, 혹시 잠겨 있어도 아래 명령이 먹도록)
+    0xD5, 0xA0,                                    // 표시 클럭 (SSD1309 권장값)
+#else
     0xD5, 0x80,                                    // 표시 클럭
+#endif
     0xA8, 0x3F,                                    // 세로 64줄
     0xD3, 0x00,                                    // 세로 오프셋 없음
     0x40,                                          // 시작 줄 0
-#if OLED_IS_SH1106
+#if OLED_CHIP == 1106
     0xAD, 0x8B,                                    // 내부 승압 회로 켜기 (SH1106)
-#else
+#elif OLED_CHIP == 1306
     0x8D, 0x14,                                    // 내부 승압 회로 켜기 (SSD1306)
+    0x20, 0x02,                                    // 줄(page) 단위 주소 모드
+    0x2E,                                          // 스크롤 끄기
+#else
+    // SSD1309에는 내부 승압 회로가 없음 → 승압은 모듈 보드의 12.5V 회로가 함 (명령 없음)
     0x20, 0x02,                                    // 줄(page) 단위 주소 모드
     0x2E,                                          // 스크롤 끄기
 #endif
     (uint8_t)(OLED_FLIP_H ? 0xA0 : 0xA1),          // 좌우 방향
     (uint8_t)(OLED_FLIP_V ? 0xC0 : 0xC8),          // 상하 방향
     0xDA, 0x12,                                    // 패널 배선 방식 (128x64)
+#if OLED_CHIP == 1309
+    0x81, 0x6F,                                    // 밝기       ─┐
+    0xD9, 0xD3,                                    // 프리차지    │ U8g2 라이브러리의 SSD1309 128x64 값
+    0xDB, 0x20,                                    // VCOMH      ─┘
+#else
     0x81, 0xCF,                                    // 밝기
     0xD9, 0xF1,                                    // 프리차지
     0xDB, 0x40,                                    // VCOMH
+#endif
     0xA4,                                          // RAM 내용을 표시
     0xA6,                                          // 정상 표시 (반전 아님)
     0xAF                                           // 화면 켜기
@@ -1388,6 +1419,28 @@ void snapshot_publish() {
   interrupts();
 }
 
+// 가상 GPS ↔ 실제 GPS 전환 (자동 전환과 set_gps_mock이 함께 씀)
+void gps_set_mock(bool on, unsigned long now) {
+  if (on == gps_use_mock) return;
+  gps_use_mock = on;
+  arrived = false;
+  turn_reset();
+  course_good_count = 0;
+  course_seq_used = gps_course_seq;
+  if (gps_use_mock) gps_mock_reset(now);           // 가상 위치·방향을 처음 값으로
+  else heading_ok = false;                         // 실제 GPS: 걷기 시작해야 방향을 알 수 있음 (가상으로 가정한 방향은 버림)
+}
+
+// 0.1초마다: 자동 모드에서 GPS 문장이 들어왔으면 실제 GPS로 바꿈
+void gps_auto_select(unsigned long now) {
+  if (!gps_auto || gps_sentence_count == 0) return;
+  gps_auto = false;                                // 한 번 바꾸면 재부팅 전까지 유지 (실측 도중 가상으로 돌아가지 않게)
+  if (gps_use_mock) {
+    gps_set_mock(false, now);
+    Monitor.print("GPS module detected on D0 -> real GPS mode\n");
+  }
+}
+
 // loop 쪽: Bridge로 들어온 설정 요청을 꺼내서 반영. 반영한 것이 있으면 true
 bool bridge_apply_requests(unsigned long now) {
   noInterrupts();
@@ -1404,14 +1457,9 @@ bool bridge_apply_requests(unsigned long now) {
     arrived = false;                               // 새 목적지 → 도착 판정 다시
     applied = true;
   }
-  if (request.mock_set && request.mock_on != gps_use_mock) {
-    gps_use_mock = request.mock_on;
-    arrived = false;
-    turn_reset();
-    course_good_count = 0;
-    course_seq_used = gps_course_seq;
-    if (gps_use_mock) gps_mock_reset(now);         // 가상 위치·방향을 처음 값으로
-    else heading_ok = false;                       // 실제 GPS: 걷기 시작해야 방향을 알 수 있음
+  if (request.mock_set) {
+    gps_auto = false;                              // 리눅스가 정하면 그 값으로 고정 (자동 전환 끝)
+    gps_set_mock(request.mock_on, now);
     applied = true;
   }
   if (request.heading_set) {
@@ -1597,7 +1645,8 @@ void run_tick(unsigned long now) {
     still_far_count = 0;
     if (!gps_use_mock && heading_ok && now - imu_last_good_ms > HEADING_LOST_MS) heading_ok = false;
   }
-  gps_tick(now);                                   // ④ GPS 유효시간 검사 / 가상 GPS 걷기
+  gps_auto_select(now);                            // ④ 자동 모드: GPS 문장이 들어왔으면 실제 GPS로
+  gps_tick(now);                                   //    GPS 유효시간 검사 / 가상 GPS 걷기
   heading_fuse_course();                           // ⑤ 걷는 중이면 GPS 진행 방향으로 heading 보정
   nav_tick(now);                                   // ⑥ 거리·방위각 계산, 방향 이탈 판단
   motor_select(now);                               // ⑦ 판단 결과 → 진동 패턴
@@ -1674,7 +1723,13 @@ void setup() {
 #else
   p = put_str(text, oled_ok ? "OLED: I2C OK" : "OLED: I2C NOT FOUND (check address 0x3C/0x3D)");
 #endif
-  p = put_str(p, gps_use_mock ? ", GPS: MOCK (virtual position)\n" : ", GPS: real module on D0\n");
+#if GPS_MODE == 2
+  p = put_str(p, ", GPS: AUTO (mock until NMEA arrives on D0)\n");
+#elif GPS_MODE == 1
+  p = put_str(p, ", GPS: MOCK (virtual position)\n");
+#else
+  p = put_str(p, ", GPS: real module on D0\n");
+#endif
   Monitor.print(text);
 
   last_tick_ms = millis() - TICK_MS;               // 첫 주기를 바로 실행
