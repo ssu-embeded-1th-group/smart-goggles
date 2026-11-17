@@ -2,7 +2,7 @@
  * sketch.ino  —  Arduino UNO Q (MCU 쪽, STM32U585)  Smart Goggles 통합 펌웨어
  * MPU-6050 + GPS + OLED 화살표 + 좌/우 진동모터, 실내 책상 디버깅용 가상 GPS(Mock) 포함
  * 코드 컨벤션: snake_case, 절차지향 (클래스 없이 함수 + 전역 상태)
- * 필요한 라이브러리: Arduino_RouterBridge, Wire 뿐 (OLED·GPS 라이브러리 설치 불필요)
+ * 필요한 라이브러리: Arduino_RouterBridge, Wire, SPI 뿐 (모두 기본 포함, OLED·GPS 라이브러리 설치 불필요)
  *
  * ── 동작 (0.1초마다) ─────────────────────────────────
  *   ① MPU-6050 읽기 → 자이로를 적분해 지금 바라보는 방향(heading) 추정
@@ -10,10 +10,13 @@
  *   ③ angle error = bearing − heading (+면 오른쪽, −면 왼쪽으로 돌아야 함) 으로 방향 이탈 판단
  *   ④ OLED: 목적지 쪽을 가리키는 화살표 + 거리 / 진동모터: 돌아야 하는 쪽이 울림
  *
- * ── 배선 (UNO Q 핀은 3.3V 로직) ──────────────────────
- *   MPU-6050 : VCC→3.3V  GND→GND  SDA→헤더 SDA  SCL→헤더 SCL   (AREF 옆 핀, A4/A5 아님)
- *   OLED     : VCC→3.3V  GND→GND  SDA→헤더 SDA  SCL→헤더 SCL   (MPU-6050과 같은 두 선에 함께 연결)
- *   GPS      : GND→GND  GPS의 TX→D0(RX)   ※ GPS의 RX는 연결하지 않음, VCC는 모듈 규격대로
+ * ── 배선 (결선도 rev 3.0, UNO Q 핀은 3.3V 로직) ──────
+ *   MPU-6050 : VCC→3.3V  GND→GND  SDA→헤더 SDA(D20)  SCL→헤더 SCL(D21)  AD0→GND (주소 0x68, A4/A5 아님)
+ *   OLED     : 4선 SPI (모듈 출고 기본값)  VCC→3.3V  GND→GND
+ *              DIN→D11  CLK→D13  CS→D10  DC→D7  RES(RST)→D8
+ *              ※ 뒷면 0Ω 저항을 옮겨 I2C로 바꾼 모듈이면 OLED_USE_SPI를 0으로 하고 SDA/SCL에 연결
+ *   GPS      : GND→GND  GPS의 TX→D0(RX)   VCC는 모듈 규격대로
+ *              ※ GPS의 RX→D1은 연결해도, 안 해도 됨 (스케치는 GPS로 아무것도 보내지 않음)
  *   진동모터 : 왼쪽 D5, 오른쪽 D6 → 트랜지스터(모터 드라이버) 모듈의 신호 입력
  *              ※ 모터를 핀에 직접 연결하면 안 됨 (모터가 핀이 낼 수 있는 전류보다 많이 씀)
  *
@@ -49,6 +52,7 @@
 
 #include <Arduino_RouterBridge.h>
 #include <Wire.h>
+#include <SPI.h>
 
 // ═════════ 1. 설정: 하드웨어에 맞게 여기만 고치면 됨 ═════════
 
@@ -70,13 +74,21 @@
 #define MOTOR_RIGHT_PIN     6
 #define MOTOR_ACTIVE_LOW    0           // 드라이버 모듈이 LOW에서 모터를 켜는 방식이면 1
 
-// I2C 버스: 헤더 SDA/SCL → Wire | Qwiic 커넥터 → Wire1 | A4/A5 → Wire2
+// I2C 버스 (MPU-6050): 헤더 SDA/SCL → Wire | Qwiic 커넥터 → Wire1 | A4/A5 → Wire2
 #define IMU_WIRE            Wire
-#define OLED_WIRE           Wire
 #define I2C_CLOCK_HZ        0           // 0: 코어 기본 속도 그대로 / 400000: 선이 짧을 때 고속
 
-// OLED (128x64, I2C)
+// OLED (128x64)
+#define OLED_USE_SPI        1           // 1: 4선 SPI (결선도 rev 3.0, 출고 기본값) / 0: I2C (0Ω 저항을 옮겨 납땜한 경우)
+// SPI일 때 (DIN→D11, CLK→D13은 하드웨어 SPI 핀으로 고정)
+#define OLED_DC_PIN         7           // DC: 데이터/명령 선택
+#define OLED_RST_PIN        8           // RES(RST): 리셋
+#define OLED_CS_PIN         10          // CS: 칩 선택
+#define OLED_SPI_HZ         4000000     // SPI 속도 [Hz] (SSD1306 최대 약 10MHz, 화면이 깨지면 1000000으로 낮춤)
+// I2C일 때
+#define OLED_WIRE           Wire        // MPU-6050과 같은 SDA/SCL
 #define OLED_ADDR           0x3C        // 대부분 0x3C, 일부 모듈은 0x3D
+// 공통
 #define OLED_IS_SH1106      0           // 0: SSD1306 (보통 0.96인치) / 1: SH1106 (보통 1.3인치)
 #define OLED_FLIP_H         0           // 1: 좌우 반전 (반사판·거울로 볼 때)
 #define OLED_FLIP_V         0           // 1: 상하 반전
@@ -214,7 +226,11 @@ const double METERS_PER_DEG    = 111320.0;      // 위도 1°의 길이 (가상 
 
 // OLED
 const uint8_t OLED_PAGES              = 8;      // 64줄 = 8픽셀짜리 줄(page) 8개
-const uint8_t OLED_CHUNK              = 16;     // 한 번의 I2C 전송에 싣는 화면 데이터 바이트 수
+#if OLED_USE_SPI
+const uint8_t OLED_CHUNK              = 128;    // 한 번의 전송에 싣는 화면 데이터 바이트 수 (SPI: 한 줄 통째로)
+#else
+const uint8_t OLED_CHUNK              = 16;     // (I2C: Wire 버퍼 크기 안에서 작게 나눔)
+#endif
 const unsigned long OLED_RETRY_MS     = 2000;   // 응답이 없을 때 다시 초기화를 시도하는 간격
 const unsigned long OLED_REFRESH_MS   = 5000;   // 설정을 다시 보내고 화면 전체를 새로 그리는 간격 (전원 순간 끊김 복구)
 #if OLED_IS_SH1106
@@ -322,6 +338,9 @@ uint8_t oled_shadow[1024];               // OLED에 이미 보낸 화면
 bool oled_page_force[8];                 // true면 비교하지 않고 그 줄 전체를 다시 보냄
 bool oled_ok = false;
 uint8_t oled_next_page = 0;
+#if OLED_USE_SPI
+uint8_t oled_spi_buf[128];               // SPI로 보낼 복사본 (아래 oled_spi_write 설명 참고)
+#endif
 unsigned long oled_retry_ms = 0;
 unsigned long oled_refresh_ms = 0;
 
@@ -994,12 +1013,63 @@ void nav_tick(unsigned long now) {
   nav_state = state;
 }
 
-// ═════════ 12. OLED (SSD1306 / SH1106, 라이브러리 없이 Wire로 직접 구동) ═════════
+// ═════════ 12. OLED (SSD1306 / SH1106, 라이브러리 없이 SPI 또는 Wire로 직접 구동) ═════════
+// ── 전송: 이 부분만 SPI / I2C에 따라 다름. 나머지(그리기·화면 갱신)는 공통 ──
+#if OLED_USE_SPI
+// DC 핀으로 명령(LOW)/데이터(HIGH)를 구분해서 보냄.
+// UNO Q의 SPI.transfer(버퍼, 길이)는 보낸 버퍼를 받은 값으로 덮어쓰므로 화면 버퍼를 직접 넘기지 않고 복사본을 보냄
+void oled_spi_write(bool is_data, const uint8_t *bytes, uint8_t count) {
+  memcpy(oled_spi_buf, bytes, count);
+  digitalWrite(OLED_DC_PIN, is_data ? HIGH : LOW);
+  SPI.beginTransaction(SPISettings(OLED_SPI_HZ, MSBFIRST, SPI_MODE0));
+  digitalWrite(OLED_CS_PIN, LOW);
+  SPI.transfer(oled_spi_buf, count);
+  digitalWrite(OLED_CS_PIN, HIGH);
+  SPI.endTransaction();
+}
+
+// setup()에서만: 핀 설정 + 하드웨어 리셋 (delay가 있어도 됨)
+void oled_hw_setup() {
+  SPI.begin();
+  pinMode(OLED_CS_PIN, OUTPUT);                    // SPI.begin() 뒤에 설정해야 CS를 직접 제어할 수 있음
+  digitalWrite(OLED_CS_PIN, HIGH);
+  pinMode(OLED_DC_PIN, OUTPUT);
+  pinMode(OLED_RST_PIN, OUTPUT);
+  digitalWrite(OLED_RST_PIN, HIGH);
+  delay(1);
+  digitalWrite(OLED_RST_PIN, LOW);                 // RES를 잠깐 LOW로 → 칩 초기화
+  delay(10);
+  digitalWrite(OLED_RST_PIN, HIGH);
+  delay(10);
+}
+#else
+void oled_hw_setup() {}                            // I2C는 Wire.begin()만 하면 됨 (setup의 ②)
+#endif
+
+// 명령 여러 개를 보냄. 성공하면 true
 bool oled_command_list(const uint8_t *commands, uint8_t count) {
+#if OLED_USE_SPI
+  oled_spi_write(false, commands, count);
+  return true;                                     // SPI는 응답(ACK)이 없어서 연결이 끊겨도 알 수 없음
+#else
   OLED_WIRE.beginTransmission(OLED_ADDR);
   OLED_WIRE.write((uint8_t)0x00);                  // 컨트롤 바이트 0x00: 뒤따르는 바이트는 모두 명령
   for (uint8_t i = 0; i < count; i++) OLED_WIRE.write(commands[i]);
+  return OLED_WIRE.endTransmission() == 0;         // 0 = OLED가 ACK(응답)함
+#endif
+}
+
+// 화면 데이터를 보냄 (count ≤ OLED_CHUNK). 성공하면 true
+bool oled_data(const uint8_t *bytes, uint8_t count) {
+#if OLED_USE_SPI
+  oled_spi_write(true, bytes, count);
+  return true;
+#else
+  OLED_WIRE.beginTransmission(OLED_ADDR);
+  OLED_WIRE.write((uint8_t)0x40);                  // 컨트롤 바이트 0x40: 뒤따르는 바이트는 화면 데이터
+  OLED_WIRE.write(bytes, count);
   return OLED_WIRE.endTransmission() == 0;
+#endif
 }
 
 // display_off_first = true: 부팅 때 (화면을 껐다가 설정 후 켬) / false: 동작 중 재설정 (깜빡임 없음)
@@ -1048,10 +1118,7 @@ bool oled_send_span(uint8_t page, uint8_t first, uint8_t last) {
   uint8_t remaining = (uint8_t)(last - first + 1);
   while (remaining > 0) {
     uint8_t chunk = remaining > OLED_CHUNK ? OLED_CHUNK : remaining;
-    OLED_WIRE.beginTransmission(OLED_ADDR);
-    OLED_WIRE.write((uint8_t)0x40);                // 컨트롤 바이트 0x40: 뒤따르는 바이트는 화면 데이터
-    OLED_WIRE.write(&oled_buf[offset], chunk);
-    if (OLED_WIRE.endTransmission() != 0) return false;
+    if (!oled_data(&oled_buf[offset], chunk)) return false;
     memcpy(&oled_shadow[offset], &oled_buf[offset], chunk);
     offset = (uint16_t)(offset + chunk);
     remaining = (uint8_t)(remaining - chunk);
@@ -1508,7 +1575,11 @@ void print_status(unsigned long now) {
   p = put_str(p, " cal=");
   p = put_uint(p, gyro_bias_ok ? 1 : 0);
   p = put_str(p, imu_latest.valid ? " imu=OK" : " imu=FAIL");
+#if OLED_USE_SPI
+  p = put_str(p, " oled=SPI");
+#else
   p = put_str(p, oled_ok ? " oled=OK" : " oled=FAIL");
+#endif
   put_str(p, "\n");
   Monitor.print(text);
 }
@@ -1543,13 +1614,18 @@ void setup() {
   digitalWrite(MOTOR_LEFT_PIN, (MOTOR_ACTIVE_LOW != 0) ? HIGH : LOW);
   digitalWrite(MOTOR_RIGHT_PIN, (MOTOR_ACTIVE_LOW != 0) ? HIGH : LOW);
 
-  // ② I2C 시작, OLED에 시작 화면
+  // ② I2C 시작, OLED 준비 후 시작 화면
   IMU_WIRE.begin();
+#if !OLED_USE_SPI
   OLED_WIRE.begin();                               // 같은 버스(Wire)면 두 번 불러도 문제없음
+#endif
 #if I2C_CLOCK_HZ > 0
   IMU_WIRE.setClock(I2C_CLOCK_HZ);
+#if !OLED_USE_SPI
   OLED_WIRE.setClock(I2C_CLOCK_HZ);
 #endif
+#endif
+  oled_hw_setup();                                 // SPI: 핀 설정 + 리셋 / I2C: 할 일 없음
   oled_ok = oled_init();
   oled_clear();
   oled_text_center(64, 6, "SMART", 2);
@@ -1593,7 +1669,11 @@ void setup() {
     p = put_str(p, "MPU-6050 NOT FOUND - check SDA/SCL header pins (not A4/A5) / AD0\n");
   }
   Monitor.print(text);
-  p = put_str(text, oled_ok ? "OLED OK" : "OLED NOT FOUND (check address 0x3C/0x3D)");
+#if OLED_USE_SPI
+  p = put_str(text, "OLED: SPI (DC D7, RST D8, CS D10) - no ACK, check the screen");
+#else
+  p = put_str(text, oled_ok ? "OLED: I2C OK" : "OLED: I2C NOT FOUND (check address 0x3C/0x3D)");
+#endif
   p = put_str(p, gps_use_mock ? ", GPS: MOCK (virtual position)\n" : ", GPS: real module on D0\n");
   Monitor.print(text);
 
