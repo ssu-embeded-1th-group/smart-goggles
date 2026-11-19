@@ -28,6 +28,7 @@ class MockBridge:
     def __init__(self):
         self._handlers: Dict[str, Callable[..., Any]] = {}
         self.call_history = []
+        self._heading: Optional[float] = None
         self._setup_default_handlers()
 
     def _setup_default_handlers(self):
@@ -35,7 +36,14 @@ class MockBridge:
         self._handlers["imu_ready"] = lambda: True
         self._handlers["read_imu"] = lambda: "0.010,-0.020,0.980,0.50,-0.10,0.05,25.30"
         self._handlers["read_pitch"] = lambda: 0.58
+        self._handlers["read_heading"] = lambda: -999.0 if self._heading is None else self._heading
+        self._handlers["set_heading"] = self._set_heading
         self._handlers["read_gps"] = lambda: ""  # 기본적으로 sketch.ino에 없으므로 빈 문자열
+
+    def _set_heading(self, heading: float, bias_z: float) -> bool:
+        """실제 MCU처럼 명시적으로 기준을 받은 뒤에만 방위각을 제공한다."""
+        self._heading = heading
+        return True
 
     def set_handler(self, func_name: str, handler: Callable[..., Any]):
         """특정 RPC 함수 이름에 대한 동작을 가로채거나 재정의합니다."""
