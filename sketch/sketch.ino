@@ -9,21 +9,24 @@
  *   AD0 → 연결 안 함(또는 GND) = I2C 주소 0x68
  *   ※ 우노 Q는 A4/A5가 헤더 SDA/SCL과 "다른" I2C 버스 → 아래 IMU_WIRE 참고
  *
- * ── Bridge로 제공하는 함수 (전부 인자 없음, Python: Bridge.call("이름")) ──
+ * ── Bridge로 제공하는 함수 (Python: Bridge.call("이름", ...)) ──
  *   imu_ready  → bool   : 센서가 I2C로 응답하면 true
  *   read_imu   → String : "ax,ay,az,gx,gy,gz,temp"  (g, °/s, °C) / 실패 시 ""
  *   read_pitch → float  : 가속도로 계산한 앞뒤 기울기(°, -90~90) / 실패 시 -999
+ *   read_heading → float: 진북 기준 시계방향 방위각(0~360 미만) / 기준 없음: -999
+ *   set_heading(heading, bias_z) → bool: 현재 자세의 알려진 방위각/자이로 바이어스 설정
  */
 
 #include <Arduino_RouterBridge.h>
 #include <Wire.h>
+#include <math.h>
 
 // 센서를 꽂은 위치에 맞게 이 한 줄만 바꾸면 됨
 //   디지털 헤더 SDA/SCL → Wire   |   Qwiic 커넥터 → Wire1   |   A4/A5 → Wire2
 #define IMU_WIRE Wire
 
 const uint8_t MPU_ADDR  = 0x68;          // AD0 = HIGH(3.3V)면 0x69
-const float   ERR_VALUE = -999.0f;       // read_pitch 실패 시 반환값
+const float   ERR_VALUE = -999.0f;       // pitch 실패 또는 heading 기준 없음
 
 // MPU-6050 레지스터 주소
 const uint8_t REG_CONFIG       = 0x1A;
@@ -40,7 +43,20 @@ struct imu_data {
   float temp;                            // 온도 [°C]
 };
 
+// Arduino의 자동 함수 원형 생성 시 사용자 정의 타입이 선언보다 앞서지 않도록 명시한다.
+bool fetch_imu_data(imu_data *out);
+
 bool imu_ok = false;                     // 초기화 성공 여부
+bool heading_valid = false;
+float current_heading = 0.0f;            // heading_valid일 때만 의미가 있음
+float gyro_z_bias = 0.0f;
+float previous_gz = 0.0f;
+uint32_t last_heading_us = 0;
+const uint32_t HEADING_PERIOD_US = 10000; // 100 Hz (Linux 기록 주기와 독립)
+
+// Z축이 위를 향할 때 MPU 오른손 법칙의 +gz는 반시계 방향이다.
+// 방위각은 시계 방향이 양수이므로 -1. 반대로 부착했다면 +1로 변경한다.
+const float GYRO_TO_HEADING_SIGN = -1.0f;
 
 // ───────── I2C 헬퍼 ─────────
 bool write_reg(uint8_t reg, uint8_t val) {
@@ -90,7 +106,10 @@ bool fetch_imu_data(imu_data *out) {
 
 // ───────── Bridge로 노출하는 함수들 ─────────
 bool imu_ready() {
-  if (!imu_ok) imu_ok = imu_init();                // 부팅 때 실패했으면 호출될 때마다 다시 시도
+  if (!imu_ok) {
+    heading_valid = false;                        // 센서 재초기화 후 과거 방위각 재사용 금지
+    imu_ok = imu_init();
+  }
   return imu_ok;
 }
 
@@ -98,6 +117,7 @@ String read_imu() {
   imu_data d;
   if (!imu_ready() || !fetch_imu_data(&d)) {
     imu_ok = false;                                // 읽기 실패 → 다음 호출 때 재초기화
+    heading_valid = false;
     return "";
   }
   String out;
@@ -116,11 +136,59 @@ float read_pitch() {
   imu_data d;
   if (!imu_ready() || !fetch_imu_data(&d)) {
     imu_ok = false;
+    heading_valid = false;
     return ERR_VALUE;
   }
   // 모듈을 평평하게 눕혀 놓으면 0°, X축 방향으로 기울이면 ±로 변함
   // (붙이는 방향에 따라 앞뒤 기울기가 다른 축에 나타날 수 있음)
   return atan2f(-d.ax, sqrtf(d.ay * d.ay + d.az * d.az)) * 57.29578f;   // rad → deg
+}
+
+bool set_heading(float heading, float bias_z) {
+  if (!isfinite(heading) || heading < 0.0f || heading >= 360.0f || !isfinite(bias_z)) {
+    return false;
+  }
+  imu_data d;
+  if (!imu_ready() || !fetch_imu_data(&d)) {
+    imu_ok = false;
+    heading_valid = false;
+    return false;
+  }
+  current_heading = heading;
+  gyro_z_bias = bias_z;
+  previous_gz = d.gz - gyro_z_bias;
+  last_heading_us = micros();
+  heading_valid = true;
+  return true;
+}
+
+void update_heading() {
+  if (!heading_valid) return;
+  uint32_t now = micros();
+  uint32_t elapsed = now - last_heading_us;       // micros() 오버플로에도 대응
+  if (elapsed < HEADING_PERIOD_US) return;
+  // 긴 통신/센서 중단 중의 회전은 복원할 수 없으므로 다시 기준을 요청한다.
+  if (elapsed > 250000) {
+    heading_valid = false;
+    return;
+  }
+  imu_data d;
+  if (!imu_ok || !fetch_imu_data(&d)) {
+    imu_ok = false;
+    heading_valid = false;
+    return;
+  }
+  float gz = d.gz - gyro_z_bias;
+  float delta = GYRO_TO_HEADING_SIGN * (previous_gz + gz) * 0.5f * (elapsed / 1000000.0f);
+  current_heading = fmodf(current_heading + delta, 360.0f);
+  if (current_heading < 0.0f) current_heading += 360.0f;
+  previous_gz = gz;
+  last_heading_us = now;
+}
+
+float read_heading() {
+  update_heading();
+  return heading_valid ? current_heading : ERR_VALUE;
 }
 
 // ───────── 실행 순서 ─────────
@@ -145,9 +213,11 @@ void setup() {
   Bridge.provide_safe("imu_ready",  imu_ready);
   Bridge.provide_safe("read_imu",   read_imu);
   Bridge.provide_safe("read_pitch", read_pitch);
+  Bridge.provide_safe("read_heading", read_heading);
+  Bridge.provide_safe("set_heading", set_heading);
 }
 
 void loop() {
-  // ⑥ 비워 둠. 리눅스에서 Bridge.call이 오면 loop()가 한 바퀴 돌 때마다 위 함수가 실행됨
-  //    (여기에 긴 delay()를 넣으면 그만큼 응답이 늦어짐)
+  // ⑥ MCU가 실제 센서 주기로 방향을 추적한다. 긴 delay()를 넣지 않는다.
+  update_heading();
 }

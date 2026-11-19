@@ -246,8 +246,8 @@ def parse_gps_data(raw_data: Any) -> Optional[Tuple[float, float]]:
         return None
 
     if isinstance(raw_data, dict):
-        lat = raw_data.get("lat") or raw_data.get("latitude")
-        lon = raw_data.get("lon") or raw_data.get("longitude")
+        lat = raw_data.get("lat", raw_data.get("latitude"))
+        lon = raw_data.get("lon", raw_data.get("longitude"))
         if validate_gps_coordinates(lat, lon):
             return float(lat), float(lon)
         return None

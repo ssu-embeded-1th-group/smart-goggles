@@ -22,6 +22,7 @@ import math
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 # 프로젝트 모듈 임포트
 import config
@@ -36,6 +37,8 @@ class TestSmartGoggles(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.test_csv = os.path.join(self.test_dir, "test_team.csv")
         self.mock_bridge = MockBridge()
+        # 기존 센서/GPS 테스트는 MCU의 기준 방향이 설정된 상태에서 수행한다.
+        self.mock_bridge.set_handler("read_heading", lambda: 0.0)
 
     def tearDown(self):
         if os.path.exists(self.test_dir):
@@ -93,9 +96,10 @@ class TestSmartGoggles(unittest.TestCase):
         gps = controller.read_gps()
         self.assertIsNone(gps)
 
-        # GPS가 없는 상태에서 루프 실행 -> 에러 없이 status: ok, latitude/longitude/target_bearing은 빈 문자열
+        # GPS 미수신을 명시하고 MCU 방향과 센서는 계속 기록한다.
         rec = controller.step()
-        self.assertEqual(rec["status"], "ok")
+        self.assertEqual(rec["status"], "waiting_gps")
+        self.assertEqual(rec["heading"], 0.0)
         self.assertEqual(rec["latitude"], "")
         self.assertEqual(rec["longitude"], "")
         self.assertEqual(rec["target_bearing"], "")
@@ -155,31 +159,188 @@ class TestSmartGoggles(unittest.TestCase):
     # 5. 초기 Heading 미설정 테스트
     # --------------------------------------------------------------------------
     def test_05_initial_heading_unset(self):
-        """
-        초기 Heading이 설정되지 않은 상태에서는 임의의 절대 방향을 출력하지 않고
-        heading=None 및 상대 회전량만 측정하는지 검증
-        """
+        """기준 미설정 상태를 명시하고 IMU 데이터는 계속 기록한다."""
+        self.mock_bridge.set_handler("read_heading", lambda: -999.0)
         controller = SmartGogglesController(
             initial_heading=None,
             gyro_z_bias=0.0,
+            bridge_instance=self.mock_bridge,
             csv_file=self.test_csv
         )
         self.assertIsNone(controller.current_heading)
         self.assertEqual(controller.relative_yaw, 0.0)
 
-        # 10도/초로 2초 동안 회전 (총 20도 회전)
         heading, rel_yaw = controller.update_heading(gz=10.0, dt=2.0)
-        # 절대 방향은 여전히 None이어야 함!
         self.assertIsNone(heading)
         self.assertIsNone(controller.current_heading)
-        # 상대 회전량은 20도 반영되어야 함
-        self.assertAlmostEqual(rel_yaw, 20.0)
-        self.assertAlmostEqual(controller.relative_yaw, 20.0)
+        self.assertEqual(rel_yaw, 0.0)  # Python에서 따로 적분하지 않음
 
         # 루프 실행 시 CSV 레코드의 heading과 angle_error가 빈 문자열인지 확인
         rec = controller.step()
         self.assertEqual(rec["heading"], "")
         self.assertEqual(rec["angle_error"], "")
+        self.assertEqual(rec["status"], "waiting_heading")
+        self.assertIn("GOGGLES_INITIAL_HEADING", rec["error"])
+        self.assertIsInstance(rec["gz"], float)
+        with open(self.test_csv, encoding="utf-8") as saved:
+            self.assertIn("waiting_heading", saved.read())
+
+    def heading_controller(self, **kwargs):
+        return SmartGogglesController(
+            bridge_instance=self.mock_bridge, csv_file=self.test_csv, **kwargs
+        )
+
+    def test_mcu_heading_is_authoritative(self):
+        self.mock_bridge.set_handler("read_heading", lambda: 350.0)
+        self.mock_bridge.set_handler("read_gps", lambda: "37.0,127.0")
+        self.mock_bridge.set_handler("read_imu", lambda: "0,0,1,0,0,100,25")
+        controller = self.heading_controller(
+            initial_heading=None, target_lat=38.0, target_lon=127.0
+        )
+        for _ in range(2):
+            rec = controller.step()
+            self.assertEqual(rec["status"], "ok")
+            self.assertEqual(rec["heading"], 350.0)
+            self.assertAlmostEqual(rec["angle_error"], 10.0)
+        self.assertEqual(controller.relative_yaw, 0.0)
+        self.assertFalse(any(call[0] == "set_heading" for call in self.mock_bridge.call_history))
+
+    def test_initial_reference_sent_once_and_confirmed_by_mcu(self):
+        self.mock_bridge = MockBridge()
+        controller = self.heading_controller(initial_heading=90.0, gyro_z_bias=0.25)
+        self.assertIsNone(controller.current_heading)
+        rec = controller.step()
+        self.assertEqual(rec["heading"], 90.0)
+        controller.step()
+        calls = [call for call in self.mock_bridge.call_history if call[0] == "set_heading"]
+        self.assertEqual(calls, [("set_heading", (90.0, 0.25), {})])
+
+    def test_zero_mcu_heading_is_valid(self):
+        rec = self.heading_controller(initial_heading=None).step()
+        self.assertEqual(rec["heading"], 0.0)
+
+    def test_existing_mcu_reference_is_preserved(self):
+        self.mock_bridge.set_handler("read_heading", lambda: 123.0)
+        rec = self.heading_controller(initial_heading=90.0).step()
+        self.assertEqual(rec["heading"], 123.0)
+        self.assertFalse(any(call[0] == "set_heading" for call in self.mock_bridge.call_history))
+
+    def test_invalid_mcu_heading_does_not_use_gyro_or_stale_heading(self):
+        for value in ("", None, True, float("nan"), float("inf"), -1, 360, "invalid"):
+            with self.subTest(value=value):
+                self.mock_bridge.set_handler("read_heading", lambda: 45.0)
+                controller = self.heading_controller(initial_heading=90.0)
+                self.assertEqual(controller.step()["heading"], 45.0)
+                self.mock_bridge.set_handler("read_heading", lambda: value)
+                rec = controller.step()
+                self.assertEqual(rec["status"], "error")
+                self.assertEqual(rec["heading"], "")
+                self.assertEqual(rec["angle_error"], "")
+                self.assertIsNone(controller.current_heading)
+
+    def test_mcu_reset_requires_new_reference(self):
+        controller = self.heading_controller(initial_heading=90.0)
+        controller.step()
+        self.mock_bridge.set_handler("read_heading", lambda: -999.0)
+        rec = controller.step()
+        self.assertEqual(rec["status"], "waiting_heading")
+        self.assertIsNone(controller.current_heading)
+        self.assertFalse(any(call[0] == "set_heading" for call in self.mock_bridge.call_history))
+
+    def test_heading_rpc_failure_and_recovery(self):
+        controller = self.heading_controller(initial_heading=None)
+        controller.step()
+        def broken_heading():
+            raise ConnectionResetError("heading RPC disconnected")
+        self.mock_bridge.set_handler("read_heading", broken_heading)
+        rec = controller.step()
+        self.assertEqual(rec["status"], "error")
+        self.assertIsNone(controller.current_heading)
+        self.assertIn("heading RPC disconnected", rec["error"])
+        self.mock_bridge.set_handler("read_heading", lambda: 270.0)
+        self.assertEqual(controller.step()["heading"], 270.0)
+
+    def test_reference_requires_acknowledgement(self):
+        self.mock_bridge.set_handler("read_heading", lambda: -999.0)
+        self.mock_bridge.set_handler("set_heading", lambda *args: False)
+        rec = self.heading_controller(initial_heading=90.0).step()
+        self.assertEqual(rec["status"], "error")
+        self.assertEqual(rec["heading"], "")
+
+    def test_reference_ack_without_heading_remains_waiting(self):
+        self.mock_bridge.set_handler("read_heading", lambda: -999.0)
+        self.mock_bridge.set_handler("set_heading", lambda *args: True)
+        controller = self.heading_controller(initial_heading=90.0)
+        rec = controller.step()
+        self.assertEqual(rec["status"], "waiting_heading")
+        self.assertEqual(rec["heading"], "")
+        self.assertIsNone(controller.current_heading)
+
+    def test_relative_change_uses_mcu_and_wraps_at_north(self):
+        headings = iter((350.0, 10.0, 350.0))
+        self.mock_bridge.set_handler("read_heading", lambda: next(headings))
+        controller = self.heading_controller(initial_heading=None)
+        self.assertEqual(controller.update_heading(1000, 1000), (350.0, 0.0))
+        self.assertEqual(controller.update_heading(1000, 1000), (10.0, 20.0))
+        self.assertEqual(controller.update_heading(1000, 1000), (350.0, 0.0))
+
+    def test_reference_loss_after_initialization_is_not_automatically_reseeded(self):
+        self.mock_bridge = MockBridge()
+        controller = self.heading_controller(initial_heading=90.0)
+        self.assertEqual(controller.step()["heading"], 90.0)
+        self.mock_bridge.set_handler("read_heading", lambda: -999.0)
+        self.assertEqual(controller.step()["status"], "waiting_heading")
+        calls = [call for call in self.mock_bridge.call_history if call[0] == "set_heading"]
+        self.assertEqual(len(calls), 1)
+
+    def test_invalid_initial_reference_is_rejected(self):
+        for value in (float("nan"), float("inf"), -1, 360, True):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.heading_controller(initial_heading=value)
+
+    def test_initial_reference_is_not_retried_after_lost_ack(self):
+        self.mock_bridge.set_handler("read_heading", lambda: -999.0)
+        def lost_ack(*args):
+            raise TimeoutError("MCU applied reference but reply was lost")
+        self.mock_bridge.set_handler("set_heading", lost_ack)
+        controller = self.heading_controller(initial_heading=90.0)
+        self.assertEqual(controller.step()["status"], "error")
+        self.assertEqual(controller.step()["status"], "waiting_heading")
+        calls = [call for call in self.mock_bridge.call_history if call[0] == "set_heading"]
+        self.assertEqual(len(calls), 1)
+
+    def test_nonfinite_sensor_values_and_failed_pitch_are_errors(self):
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                self.mock_bridge.set_handler("read_imu", lambda: f"0,0,1,0,0,{value},25")
+                rec = self.heading_controller().step()
+                self.assertEqual(rec["status"], "error")
+                self.assertEqual(rec["heading"], "")
+        self.mock_bridge.set_handler("read_imu", lambda: "0,0,1,0,0,0,25")
+        for value in (-999.0, "", None, True, "nan", 91.0):
+            with self.subTest(pitch=value):
+                self.mock_bridge.set_handler("read_pitch", lambda: value)
+                self.assertEqual(self.heading_controller().step()["status"], "error")
+
+    def test_csv_failure_is_reported_in_returned_record(self):
+        controller = self.heading_controller()
+        with patch.object(controller, "save_csv", return_value=False):
+            rec = controller.step()
+        self.assertEqual(rec["status"], "error")
+        self.assertIn("CSV", rec["error"])
+        with patch("main.os.path.getsize", side_effect=PermissionError("denied")):
+            with patch("main.os.path.exists", return_value=True):
+                self.assertFalse(controller.save_csv({}))
+
+    def test_invalid_loop_interval_is_rejected(self):
+        for value in (0, -1, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.heading_controller(interval=value)
+
+    def test_zero_gps_coordinates_in_dictionary(self):
+        self.assertEqual(navigation.parse_gps_data({"lat": 0, "lon": 0}), (0.0, 0.0))
 
     # --------------------------------------------------------------------------
     # 6. 방위각 계산 정상 여부 테스트

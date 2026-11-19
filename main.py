@@ -2,12 +2,14 @@
 main.py - Arduino UNO Q Smart Goggles 메인 프로그램
 
 Arduino UNO Q(Linux 환경)에서 실행되는 메인 센서 수집, 방위각 계산,
-자이로 방향 추정 및 표준 CSV 자동 저장 프로그램입니다.
+MCU 방향 수신 및 표준 CSV 자동 저장 프로그램입니다.
 
 Bridge 통신 규약:
   - imu_ready  -> bool   : 센서 I2C 응답 여부
   - read_imu   -> String : "ax,ay,az,gx,gy,gz,temp" (g, °/s, °C)
   - read_pitch -> float  : 가속도 기반 피치 각도 (°)
+  - read_heading -> float: MCU의 진북 기준 시계방향 방위각, 미설정 시 -999
+  - set_heading(heading, bias_z) -> bool: 현재 자세의 기준 방위각과 바이어스 설정
   - read_gps   -> String : "lat,lon" (확장 대비용)
 """
 
@@ -16,6 +18,7 @@ import sys
 import time
 import csv
 import logging
+import math
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 
@@ -69,9 +72,21 @@ class SmartGogglesController:
     ):
         self.target_lat = target_lat
         self.target_lon = target_lon
-        self.current_heading: Optional[float] = initial_heading
+        if initial_heading is not None and (
+            isinstance(initial_heading, bool)
+            or not math.isfinite(initial_heading)
+            or not 0.0 <= initial_heading < 360.0
+        ):
+            raise ValueError("초기 방위각은 진북 기준 0 이상 360 미만의 유한한 값이어야 합니다.")
+        if not math.isfinite(gyro_z_bias):
+            raise ValueError("자이로 바이어스는 유한한 값이어야 합니다.")
+        if not math.isfinite(interval) or interval <= 0.0:
+            raise ValueError("수집 주기는 0보다 큰 유한한 값이어야 합니다.")
+        self.initial_heading = float(initial_heading) if initial_heading is not None else None
+        self.current_heading: Optional[float] = None
+        self._heading_established = False
         self.relative_yaw: float = 0.0
-        self.gyro_z_bias: float = gyro_z_bias
+        self.gyro_z_bias: float = float(gyro_z_bias)
         self.csv_file = csv_file
         self.interval = interval
         self.gps_source = gps_source
@@ -104,11 +119,13 @@ class SmartGogglesController:
 
         pitch_val = self.bridge.call("read_pitch")
         try:
+            if isinstance(pitch_val, bool):
+                raise ValueError("bool pitch")
             pitch_float = float(pitch_val)
-            if pitch_float <= -990.0:  # sketch.ino의 ERR_VALUE(-999.0) 대응
-                pitch_float = 0.0
-        except (ValueError, TypeError):
-            pitch_float = 0.0
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"MCU read_pitch 형식 오류: {pitch_val!r}") from e
+        if not math.isfinite(pitch_float) or not -90.0 <= pitch_float <= 90.0:
+            raise ValueError(f"MCU read_pitch 실패/범위 오류: {pitch_val!r}")
 
         parsed_imu["pitch"] = pitch_float
         return parsed_imu
@@ -169,6 +186,8 @@ class SmartGogglesController:
             val = sensor_data[key]
             if not isinstance(val, (int, float)):
                 return False, f"센서 값 타입 오류 ({key}={val})"
+            if isinstance(val, bool) or not math.isfinite(val):
+                return False, f"센서 값이 유한한 숫자가 아닙니다 ({key}={val})"
 
         # GPS 데이터는 옵션(실내 또는 위성 미수신 상황 고려)이지만,
         # 존재할 경우 유효 좌표 범위(-90~90, -180~180)인지 확인
@@ -192,23 +211,55 @@ class SmartGogglesController:
             current_lat, current_lon, self.target_lat, self.target_lon
         )
 
-    def update_heading(self, gz: float, dt: float) -> Tuple[Optional[float], float]:
-        """
-        MPU-6050의 Z축 각속도(deg/s)를 적분하여 방향을 갱신합니다.
+    def read_heading(self) -> Optional[float]:
+        """MCU 방위각만 사용한다. 미설정(-999)과 통신/포맷 오류를 구분한다."""
+        try:
+            raw_heading = self.bridge.call("read_heading")
+        except Exception as e:
+            raise RuntimeError(f"MCU read_heading RPC 실패 (스케치 업데이트/연결 확인): {e}") from e
+        if isinstance(raw_heading, bool) or raw_heading is None or raw_heading == "":
+            raise ValueError("MCU read_heading 응답 없음/형식 오류: 업데이트된 스케치를 업로드하세요.")
+        try:
+            heading = float(raw_heading)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"MCU read_heading 형식 오류: {raw_heading!r}") from e
+        if heading == -999.0:
+            return None
+        if not math.isfinite(heading) or not 0.0 <= heading < 360.0:
+            raise ValueError(f"MCU read_heading 범위 오류: {raw_heading!r}")
+        return heading
 
-        Returns:
-            (current_heading, relative_yaw)
-            - 초기 Heading 미설정 시 current_heading은 None 유지
+    def update_heading(
+        self, gz: Optional[float] = None, dt: Optional[float] = None
+    ) -> Tuple[Optional[float], float]:
         """
-        new_heading, new_relative_yaw, _ = navigation.update_heading(
-            self.current_heading,
-            gz,
-            dt,
-            bias_z=self.gyro_z_bias,
-            relative_yaw=self.relative_yaw
-        )
-        self.current_heading = new_heading
-        self.relative_yaw = new_relative_yaw
+        MCU에서 방향을 수신한다. 기존 호출 호환용 gz/dt는 적분에 사용하지 않는다.
+        relative_yaw는 연속 MCU 방위각 사이의 변화량만 추적하며,
+        기준/통신을 잃으면 초기화한다 (표본 사이 회전은 180도 미만이어야 함).
+        """
+        previous_heading = self.current_heading
+        self.current_heading = None
+        try:
+            heading = self.read_heading()
+            # 시작할 때 MCU에 기준이 없다면 사용자가 지정한 방향을 한 번 전달한다.
+            # 실행 중 기준이 사라지면 과거의 시작 방향을 재사용하지 않는다.
+            if heading is None and not self._heading_established and self.initial_heading is not None:
+                # 요청이 적용된 뒤 응답만 유실될 수 있으므로 전송 전에 재시도를 막는다.
+                self._heading_established = True
+                acknowledged = self.bridge.call("set_heading", self.initial_heading, self.gyro_z_bias)
+                if acknowledged is not True:
+                    raise RuntimeError("MCU set_heading 기준 방향 설정 실패: 스케치/센서 연결을 확인하세요.")
+                heading = self.read_heading()
+            if heading is not None:
+                self._heading_established = True
+                if previous_heading is not None:
+                    self.relative_yaw += navigation.normalize_angle_180(heading - previous_heading)
+                self.current_heading = heading
+            else:
+                self.relative_yaw = 0.0
+        except Exception:
+            self.relative_yaw = 0.0
+            raise
         return self.current_heading, self.relative_yaw
 
     def calculate_angle_error(
@@ -231,7 +282,6 @@ class SmartGogglesController:
             저장 성공 여부 (bool)
         """
         file_path = self.csv_file
-        needs_header = not os.path.exists(file_path) or os.path.getsize(file_path) == 0
 
         # 저장할 레코드 정리 (None은 빈 문자열로 처리, 소수점 자릿수 정리)
         row_to_write = []
@@ -248,6 +298,7 @@ class SmartGogglesController:
             row_to_write.append(formatted_val)
 
         try:
+            needs_header = not os.path.exists(file_path) or os.path.getsize(file_path) == 0
             parent_dir = os.path.dirname(file_path)
             if parent_dir:
                 os.makedirs(parent_dir, exist_ok=True)
@@ -269,7 +320,6 @@ class SmartGogglesController:
         """
         now = time.monotonic()
         if self.last_time is None:
-            dt = self.interval
             interval_str: Any = ""
         else:
             dt = max(0.001, now - self.last_time)
@@ -330,8 +380,8 @@ class SmartGogglesController:
             else:
                 t_bearing = None
 
-            # 4. 자이로 Heading 갱신
-            c_heading, _ = self.update_heading(sensor_data["gz"], dt)
+            # 4. MCU의 현재 방위각 수신 (Python에서 자이로를 별도 적분하지 않음)
+            c_heading, _ = self.update_heading()
             if c_heading is not None:
                 record["heading"] = c_heading
 
@@ -341,15 +391,28 @@ class SmartGogglesController:
                 if angle_err is not None:
                     record["angle_error"] = angle_err
 
-            record["status"] = "ok"
+            if c_heading is None:
+                record["status"] = "waiting_heading"
+                record["error"] = (
+                    "MCU 기준 방향 미설정/소실: 실제 바라보는 방위각을 확인한 뒤 "
+                    "GOGGLES_INITIAL_HEADING(0=진북, 90=동, 180=남, 270=서)을 설정하고 "
+                    "현재 자세에서 다시 시작하거나 MCU set_heading으로 재설정하세요."
+                )
+            elif t_bearing is None:
+                record["status"] = "waiting_gps"
+                record["error"] = "목표 방위각 계산 불가: GPS 수신 및 현재/목표 좌표를 확인하세요."
 
         except Exception as e:
+            self.current_heading = None
+            self.relative_yaw = 0.0
             record["status"] = "error"
             record["error"] = str(e)
             logger.warning(f"루프 처리 중 에러 발생: {e}")
 
         # 6. CSV 저장
-        self.save_csv(record)
+        if not self.save_csv(record):
+            record["status"] = "error"
+            record["error"] = "; ".join(filter(None, (record["error"], "CSV 저장 실패")))
         return record
 
 
@@ -379,8 +442,8 @@ def calculate_target_bearing(current_lat: Optional[float], current_lon: Optional
     return _controller.calculate_target_bearing(current_lat, current_lon)
 
 
-def update_heading(gz: float, dt: float) -> Tuple[Optional[float], float]:
-    """자이로 데이터를 이용한 방향 추정 권장 함수"""
+def update_heading(gz: Optional[float] = None, dt: Optional[float] = None) -> Tuple[Optional[float], float]:
+    """MCU 방향 수신 권장 함수 (gz/dt는 기존 호출 호환용)."""
     return _controller.update_heading(gz, dt)
 
 
@@ -403,12 +466,20 @@ def main(max_iterations: Optional[int] = None):
     logger.info(f"실행 환경: {'Arduino UNO Q Linux (Real)' if HAS_REAL_ARDUINO_ENV else 'PC / Mock Mode'}")
     logger.info(f"CSV 저장 경로: {config.CSV_FILE}")
     logger.info(f"목표 좌표: Lat {config.TARGET_LATITUDE}, Lon {config.TARGET_LONGITUDE}")
-    logger.info(f"초기 Heading: {config.INITIAL_HEADING} (None이면 상대각도 모드)")
+    logger.info(f"초기 Heading: {config.INITIAL_HEADING} (MCU 기준 미설정 시에만 전달)")
+    if config.INITIAL_HEADING is None:
+        logger.info("MCU 방향을 우선 사용합니다. 기준이 없으면 GOGGLES_INITIAL_HEADING에 실제 시작 방위각을 설정하세요.")
     logger.info(f"GPS 모드: {config.GPS_SOURCE}")
     logger.info("==========================================")
 
+    last_status: Optional[str] = None
+
     def loop():
-        _controller.step()
+        nonlocal last_status
+        record = _controller.step()
+        if record["status"].startswith("waiting_") and record["status"] != last_status:
+            logger.warning("%s: %s", record["status"], record["error"])
+        last_status = record["status"]
         time.sleep(config.LOOP_INTERVAL)
 
     if HAS_REAL_ARDUINO_ENV and _ArduinoApp is not None:
