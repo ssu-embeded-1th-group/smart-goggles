@@ -28,6 +28,7 @@ class MockBridge:
     def __init__(self):
         self._handlers: Dict[str, Callable[..., Any]] = {}
         self.call_history = []
+        self._heading: Optional[float] = 0.0  # 통합 스케치의 기본 가상 GPS 시작 방향
         self._setup_default_handlers()
 
     def _setup_default_handlers(self):
@@ -35,7 +36,19 @@ class MockBridge:
         self._handlers["imu_ready"] = lambda: True
         self._handlers["read_imu"] = lambda: "0.010,-0.020,0.980,0.50,-0.10,0.05,25.30"
         self._handlers["read_pitch"] = lambda: 0.58
-        self._handlers["read_gps"] = lambda: ""  # 기본적으로 sketch.ino에 없으므로 빈 문자열
+        self._handlers["read_gps"] = lambda: "37.495000,126.955000"
+        self._handlers["read_nav"] = self._read_nav
+        self._handlers["set_heading"] = self._set_heading
+
+    def _read_nav(self) -> str:
+        state = "GUIDE" if self._heading is not None else "NO_HEADING"
+        heading = "" if self._heading is None else str(self._heading)
+        return f"1000,{state},0,,{heading},53.3,242.0,37.495000,126.955000,0,1,1"
+
+    def _set_heading(self, heading: float) -> bool:
+        """통합 스케치의 인자 1개 규약. 다음 read_nav에서 설정 결과를 볼 수 있다."""
+        self._heading = heading
+        return True
 
     def set_handler(self, func_name: str, handler: Callable[..., Any]):
         """특정 RPC 함수 이름에 대한 동작을 가로채거나 재정의합니다."""

@@ -49,25 +49,26 @@ MOCK_GPS_LATITUDE = 37.4950
 MOCK_GPS_LONGITUDE = 126.9550
 
 # ==============================================================================
-# 4. 방향 추정 (Heading) 및 자이로 설정 [미확정 사항 대응]
+# 4. MCU 방향 초기화 및 기존 호출 호환 설정
 # ==============================================================================
 # 초기 방위각 (도, 0.0 ~ 359.9):
 # MPU-6050은 지자기 센서(나침반)가 없어 절대 방위각을 자체적으로 알 수 없습니다.
-# 초기 방위각이 외부에서 주어지지 않는 경우 None으로 유지하여
-# "임의의 절대 방향을 출력하지 않음" 원칙을 준수합니다.
-# 절대 방위각을 알고 시작하려면 0.0 ~ 360.0 사이의 float 값을 설정하세요.
+# read_nav에 MCU 방향이 있으면 그대로 사용합니다 (초기값 불필요).
+# MCU 방향이 없을 때만 set_heading(deg)으로 1회 요청합니다.
+# 실제 GPS는 이동 방향으로 초기화하고, 가상 GPS는 스케치의 시작 방향을 사용합니다.
+# 수동 설정 시 현재 바라보는 진북 기준 시계방향 각도(0 이상 360 미만)를 입력하세요.
 INITIAL_HEADING = None
 if os.environ.get("GOGGLES_INITIAL_HEADING"):
     try:
         INITIAL_HEADING = float(os.environ.get("GOGGLES_INITIAL_HEADING"))
-    except ValueError:
-        INITIAL_HEADING = None
+    except ValueError as e:
+        raise ValueError("GOGGLES_INITIAL_HEADING에는 실제 시작 방위각을 숫자로 입력하세요.") from e
 
-# MPU-6050 Z축 자이로 바이어스 (오프셋 보정값, deg/s)
-# 센서 정지 상태에서 측정된 gz 평균 오차를 입력하여 드리프트를 줄입니다.
+# 아래 자이로 설정은 이전 Python 호출과의 호환용입니다.
+# 통합 MCU 펌웨어가 자동 영점 보정/적분을 수행하므로 Python에서는 적용/전송하지 않습니다.
 GYRO_Z_BIAS = float(os.environ.get("GOGGLES_GYRO_Z_BIAS", 0.0))
 
-# 부팅 시작 시 정지 상태 캘리브레이션 수행 여부 (초기 정지 상태 유지 필요)
+# 기존 설정 호환용 (MCU 영점 측정은 이 환경변수와 관계없이 수행)
 AUTO_CALIBRATE_GYRO = os.environ.get("GOGGLES_AUTO_CALIBRATE", "False").lower() in ("true", "1", "yes")
 CALIBRATION_SAMPLES = 50
 
